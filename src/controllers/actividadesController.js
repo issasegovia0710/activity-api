@@ -178,6 +178,48 @@ function leerAuxiliar(auxiliar) {
   }
 }
 
+function crearAuxiliarPendiente(actividad, fechaFin) {
+  const esAutoacompletable = Number(actividad.actividad_autoacompletable || 0) === 1;
+
+  if (!esAutoacompletable) {
+    return null;
+  }
+
+  const penalizacion = Math.ceil(Number(actividad.valor_exp || 0) / 2);
+  const limiteAutoacompletado = fechaFin ? sumarUnaHora(fechaFin) : null;
+
+  return JSON.stringify({
+    autoacompletada: true,
+    cumplida: null,
+    fecha_autoacompletado: null,
+    fecha_cumplimiento: null,
+    penalizacion_xp: penalizacion,
+    limite_autoacompletado: limiteAutoacompletado,
+  });
+}
+
+function crearAuxiliarCumplida(actividad, auxiliarActual = {}) {
+  const esAutoacompletable = Number(actividad.actividad_autoacompletable || 0) === 1;
+
+  if (!esAutoacompletable) {
+    return actividad.auxiliar || null;
+  }
+
+  const penalizacion = Math.ceil(Number(actividad.valor_exp || 0) / 2);
+  const limiteAutoacompletado =
+    auxiliarActual.limite_autoacompletado ||
+    (actividad.fecha_fin ? sumarUnaHora(actividad.fecha_fin) : null);
+
+  return JSON.stringify({
+    ...auxiliarActual,
+    autoacompletada: true,
+    cumplida: true,
+    fecha_cumplimiento: normalizarFechaMysql(new Date()),
+    penalizacion_xp: auxiliarActual.penalizacion_xp || penalizacion,
+    limite_autoacompletado: limiteAutoacompletado,
+  });
+}
+
 function obtenerCodigoDia(fecha) {
   const f = fechaMysqlADate(fecha);
 
@@ -370,29 +412,11 @@ function calcularSiguienteFechaInicio(actividad) {
     return null;
   }
 
+  const horaBase = obtenerHoraDeFecha(actividad.fecha_inicio);
   const diasFijos = obtenerDiasPermitidosPorRepeticion(repetecion);
 
   if (diasFijos) {
-    const horaBase = obtenerHoraDeFecha(actividad.fecha_inicio);
-
-    for (let i = 1; i <= 21; i += 1) {
-      const candidataBase = new Date(fechaBase);
-      candidataBase.setDate(fechaBase.getDate() + i);
-
-      const codigoDia = obtenerCodigoDia(candidataBase);
-
-      if (!diasFijos.includes(codigoDia)) {
-        continue;
-      }
-
-      const candidata = aplicarHoraAFecha(candidataBase, horaBase);
-
-      if (candidata) {
-        return normalizarFechaMysql(candidata);
-      }
-    }
-
-    return null;
+    return buscarProximaFechaDesdeAhora(diasFijos, horaBase);
   }
 
   const personalizados = parsearDiasPersonalizados(actividad.repetecion);
@@ -401,27 +425,22 @@ function calcularSiguienteFechaInicio(actividad) {
     const candidatas = [];
 
     for (const item of personalizados) {
-      for (let i = 1; i <= 21; i += 1) {
-        const candidataBase = new Date(fechaBase);
-        candidataBase.setDate(fechaBase.getDate() + i);
+      const proximaFecha = buscarProximaFechaDesdeAhora([item.dia], item.hora);
 
-        const codigoDia = obtenerCodigoDia(candidataBase);
-
-        if (codigoDia !== item.dia) {
-          continue;
-        }
-
-        const candidata = aplicarHoraAFecha(candidataBase, item.hora);
-
-        if (candidata) {
-          candidatas.push({
-            fecha: normalizarFechaMysql(candidata),
-            timestamp: candidata.getTime(),
-          });
-        }
-
-        break;
+      if (!proximaFecha) {
+        continue;
       }
+
+      const fechaCandidata = fechaMysqlADate(proximaFecha);
+
+      if (!fechaCandidata) {
+        continue;
+      }
+
+      candidatas.push({
+        fecha: proximaFecha,
+        timestamp: fechaCandidata.getTime(),
+      });
     }
 
     if (candidatas.length === 0) {
@@ -445,10 +464,17 @@ async function crearSiguienteActividadSiAplica(connection, actividad) {
 
   const siguienteFechaFin = sumarHoras(siguienteFechaInicio, actividad.duracion_horas);
   const plantillaId = actividad.plantilla_id || actividad.id;
+  const auxiliarPendiente = crearAuxiliarPendiente(
+    {
+      ...actividad,
+      actividad_autoacompletable: actividad.actividad_autoacompletable,
+    },
+    siguienteFechaFin
+  );
 
   const [duplicadas] = await connection.query(
     `
-      SELECT id
+      SELECT id, estatus, auxiliar
       FROM actividades
       WHERE usuario_id = ?
         AND fecha_inicio = ?
@@ -467,7 +493,30 @@ async function crearSiguienteActividadSiAplica(connection, actividad) {
   );
 
   if (duplicadas && duplicadas.length > 0) {
-    return duplicadas[0].id;
+    const duplicada = duplicadas[0];
+
+    if (
+      duplicada.estatus === 'no_cumplida' ||
+      duplicada.estatus === 'fallida' ||
+      duplicada.estatus === 'vencida'
+    ) {
+      await connection.query(
+        `
+          UPDATE actividades
+          SET estatus = 'pendiente',
+              auxiliar = ?
+          WHERE id = ?
+            AND usuario_id = ?
+        `,
+        [
+          auxiliarPendiente,
+          Number(duplicada.id),
+          Number(actividad.usuario_id),
+        ]
+      );
+    }
+
+    return duplicada.id;
   }
 
   const sql = `
@@ -507,7 +556,7 @@ async function crearSiguienteActividadSiAplica(connection, actividad) {
     Number(plantillaId),
     actividad.repetecion || null,
     'pendiente',
-    null,
+    auxiliarPendiente,
   ];
 
   const [resultado] = await connection.query(sql, valores);
@@ -732,6 +781,16 @@ exports.agregarActividad = async (req, res) => {
 
     const fechaFinMysql = sumarHoras(fechaInicioMysql, duracion_horas);
 
+    const actividadParaAuxiliar = {
+      valor_exp,
+      actividad_autoacompletable,
+    };
+
+    const auxiliarFinal =
+      auxiliar && String(auxiliar).trim()
+        ? String(auxiliar).trim()
+        : crearAuxiliarPendiente(actividadParaAuxiliar, fechaFinMysql);
+
     const sql = `
       INSERT INTO actividades (
         usuario_id,
@@ -769,7 +828,7 @@ exports.agregarActividad = async (req, res) => {
       null,
       repetecion && String(repetecion).trim() ? String(repetecion).trim() : null,
       estatus && String(estatus).trim() ? String(estatus).trim() : 'pendiente',
-      auxiliar && String(auxiliar).trim() ? String(auxiliar).trim() : null,
+      auxiliarFinal,
     ];
 
     const [resultado] = await db.query(sql, valores);
@@ -794,7 +853,7 @@ exports.agregarActividad = async (req, res) => {
       plantilla_id: null,
       repetecion: repetecion || null,
       estatus: estatus || 'pendiente',
-      auxiliar: auxiliar || null,
+      auxiliar: auxiliarFinal,
     };
 
     const io = req.app.get('socketio');
@@ -873,14 +932,22 @@ exports.completarActividad = async (req, res) => {
       });
     }
 
+    const auxiliarActual = leerAuxiliar(actividadPrevia.auxiliar);
+    const auxiliarCumplida = crearAuxiliarCumplida(actividadPrevia, auxiliarActual);
+
     await connection.query(
       `
         UPDATE actividades
-        SET estatus = 'completada'
+        SET estatus = 'completada',
+            auxiliar = ?
         WHERE id = ?
           AND usuario_id = ?
       `,
-      [Number(id), Number(usuario_id)]
+      [
+        auxiliarCumplida,
+        Number(id),
+        Number(usuario_id),
+      ]
     );
 
     let siguienteActividadId = null;
@@ -916,6 +983,7 @@ exports.completarActividad = async (req, res) => {
         fecha_inicio: actividadPrevia.fecha_inicio,
         fecha_fin: actividadPrevia.fecha_fin,
         estatus: 'completada',
+        auxiliar: auxiliarCumplida,
       },
       siguiente_actividad_id: siguienteActividadId,
     });
@@ -1046,6 +1114,31 @@ exports.editarActividad = async (req, res) => {
 
     const fechaFinMysql = sumarHoras(fechaInicioMysql, duracionFinal);
 
+    const actividadParaAuxiliar = {
+      ...actividadPrevia,
+      valor_exp,
+      fecha_fin: fechaFinMysql,
+      actividad_autoacompletable:
+        actividad_autoacompletable === undefined ||
+        actividad_autoacompletable === null
+          ? actividadPrevia.actividad_autoacompletable
+          : actividad_autoacompletable,
+    };
+
+    let auxiliarFinal =
+      auxiliar && String(auxiliar).trim() ? String(auxiliar).trim() : null;
+
+    if (nuevoEstatus === 'pendiente' && !auxiliarFinal) {
+      auxiliarFinal = crearAuxiliarPendiente(actividadParaAuxiliar, fechaFinMysql);
+    }
+
+    if (nuevoEstatus === 'completada') {
+      auxiliarFinal = crearAuxiliarCumplida(
+        actividadParaAuxiliar,
+        leerAuxiliar(auxiliarFinal || actividadPrevia.auxiliar)
+      );
+    }
+
     const sql = `
       UPDATE actividades
       SET
@@ -1077,7 +1170,7 @@ exports.editarActividad = async (req, res) => {
       Number(actividad_autoacompletable || 0),
       repetecion && String(repetecion).trim() ? String(repetecion).trim() : null,
       nuevoEstatus,
-      auxiliar && String(auxiliar).trim() ? String(auxiliar).trim() : null,
+      auxiliarFinal,
       Number(id),
       Number(usuario_id),
     ];
@@ -1099,7 +1192,7 @@ exports.editarActividad = async (req, res) => {
       actividad_autoacompletable: Number(actividad_autoacompletable || 0),
       repetecion: repetecion || null,
       estatus: nuevoEstatus,
-      auxiliar: auxiliar || null,
+      auxiliar: auxiliarFinal,
     };
 
     let siguienteActividadId = null;
@@ -1235,8 +1328,13 @@ exports.procesarVencidas = async (req, res) => {
     const procesadas = [];
 
     for (const actividad of vencidas) {
-      const penalizacion = Math.ceil(Number(actividad.valor_exp || 0) / 2);
       const auxiliarActual = leerAuxiliar(actividad.auxiliar);
+
+      if (auxiliarActual.cumplida === true) {
+        continue;
+      }
+
+      const penalizacion = Math.ceil(Number(actividad.valor_exp || 0) / 2);
       const limiteAutoacompletado = sumarUnaHora(actividad.fecha_fin);
 
       const nuevoAuxiliar = {
@@ -1266,7 +1364,7 @@ exports.procesarVencidas = async (req, res) => {
       await connection.query(
         `
           UPDATE usuario
-          SET exp = exp - ?
+          SET exp = GREATEST(exp - ?, 0)
           WHERE id = ?
         `,
         [penalizacion, Number(usuario_id)]
