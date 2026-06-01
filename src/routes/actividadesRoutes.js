@@ -14,6 +14,9 @@ router.post('/', actividadesController.agregarActividad);
 
 router.put('/:id/completar', actividadesController.completarActividad);
 
+// NUEVO: solo edita fecha/hora de cierre
+router.put('/:id/cierre', actividadesController.editarCierreActividad);
+
 router.put('/:id', actividadesController.editarActividad);
 router.delete('/:id', actividadesController.eliminarActividad);
 

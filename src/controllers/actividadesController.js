@@ -1427,3 +1427,184 @@ exports.procesarVencidas = async (req, res) => {
     connection.release();
   }
 };
+
+exports.editarCierreActividad = async (req, res) => {
+  const connection = await db.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    const usuario_id = req.usuario?.id;
+    const { id } = req.params;
+
+    const fechaCierreRecibida =
+      req.body.fecha_fin ??
+      req.body.fecha_cierre ??
+      req.body.fechaFin ??
+      req.body.fechaCierre ??
+      req.body.cierre;
+
+    if (!usuario_id) {
+      await connection.rollback();
+
+      return res.status(401).json({
+        status: 'error',
+        mensaje: 'No hay usuario en sesión',
+      });
+    }
+
+    if (
+      fechaCierreRecibida === undefined ||
+      fechaCierreRecibida === null ||
+      String(fechaCierreRecibida).trim() === ''
+    ) {
+      await connection.rollback();
+
+      return res.status(400).json({
+        status: 'error',
+        mensaje: 'Falta fecha_fin para actualizar el cierre',
+      });
+    }
+
+    const fechaFinMysql = normalizarFechaMysql(fechaCierreRecibida);
+
+    if (!fechaFinMysql) {
+      await connection.rollback();
+
+      return res.status(400).json({
+        status: 'error',
+        mensaje: 'La fecha de cierre no es válida',
+        fecha_recibida: fechaCierreRecibida,
+      });
+    }
+
+    const [actividadesPrevias] = await connection.query(
+      `
+        SELECT *
+        FROM actividades
+        WHERE id = ?
+          AND usuario_id = ?
+        LIMIT 1
+      `,
+      [Number(id), Number(usuario_id)]
+    );
+
+    if (!actividadesPrevias || actividadesPrevias.length === 0) {
+      await connection.rollback();
+
+      return res.status(404).json({
+        status: 'error',
+        mensaje: 'Actividad no encontrada',
+      });
+    }
+
+    const actividadPrevia = actividadesPrevias[0];
+
+    const fechaInicioDate = fechaMysqlADate(actividadPrevia.fecha_inicio);
+    const fechaFinDate = fechaMysqlADate(fechaFinMysql);
+
+    if (!fechaFinDate) {
+      await connection.rollback();
+
+      return res.status(400).json({
+        status: 'error',
+        mensaje: 'No se pudo interpretar la fecha de cierre',
+      });
+    }
+
+    if (fechaInicioDate && fechaFinDate < fechaInicioDate) {
+      await connection.rollback();
+
+      return res.status(400).json({
+        status: 'error',
+        mensaje: 'La fecha de cierre no puede ser menor que la fecha de inicio',
+      });
+    }
+
+    let auxiliarFinal = actividadPrevia.auxiliar || null;
+
+    const esAutoacompletable =
+      Number(actividadPrevia.actividad_autoacompletable || 0) === 1;
+
+    const estatusActual = String(actividadPrevia.estatus || '').trim().toLowerCase();
+
+    if (esAutoacompletable && estatusActual !== 'completada') {
+      const auxiliarActual = leerAuxiliar(actividadPrevia.auxiliar);
+      const penalizacion = Math.ceil(Number(actividadPrevia.valor_exp || 0) / 2);
+      const limiteAutoacompletado = sumarUnaHora(fechaFinMysql);
+
+      auxiliarFinal = JSON.stringify({
+        ...auxiliarActual,
+        autoacompletada: true,
+        cumplida:
+          auxiliarActual.cumplida === undefined
+            ? null
+            : auxiliarActual.cumplida,
+        fecha_autoacompletado:
+          auxiliarActual.fecha_autoacompletado === undefined
+            ? null
+            : auxiliarActual.fecha_autoacompletado,
+        fecha_cumplimiento:
+          auxiliarActual.fecha_cumplimiento === undefined
+            ? null
+            : auxiliarActual.fecha_cumplimiento,
+        penalizacion_xp: auxiliarActual.penalizacion_xp || penalizacion,
+        limite_autoacompletado: limiteAutoacompletado,
+      });
+    }
+
+    const [resultado] = await connection.query(
+      `
+        UPDATE actividades
+        SET fecha_fin = ?,
+            auxiliar = ?
+        WHERE id = ?
+          AND usuario_id = ?
+      `,
+      [
+        fechaFinMysql,
+        auxiliarFinal,
+        Number(id),
+        Number(usuario_id),
+      ]
+    );
+
+    const actividadActualizada = {
+      ...actividadPrevia,
+      id: Number(id),
+      usuario_id: Number(usuario_id),
+      fecha_fin: fechaFinMysql,
+      auxiliar: auxiliarFinal,
+    };
+
+    await connection.commit();
+
+    const io = req.app.get('socketio');
+
+    if (io) {
+      io.emit('actividad_cierre_editado', actividadActualizada);
+      io.emit('actividad_editada', actividadActualizada);
+    }
+
+    return res.status(200).json({
+      status: 'ok',
+      mensaje: 'Fecha de cierre actualizada correctamente',
+      actividad: actividadActualizada,
+      affectedRows: resultado.affectedRows,
+    });
+  } catch (error) {
+    await connection.rollback();
+
+    console.error('Error al editar cierre de actividad:', error);
+
+    return res.status(500).json({
+      status: 'error',
+      mensaje: 'Error al editar la fecha de cierre',
+      detalle: error.message,
+      codigo: error.code,
+      sqlMessage: error.sqlMessage,
+    });
+  } finally {
+    connection.release();
+  }
+};
