@@ -840,3 +840,300 @@ exports.eliminarActividadDiaria = async (req, res) => {
     });
   }
 };
+
+function obtenerFechaHoyMysql() {
+  const fecha = new Date();
+
+  const year = fecha.getFullYear();
+  const month = String(fecha.getMonth() + 1).padStart(2, '0');
+  const day = String(fecha.getDate()).padStart(2, '0');
+
+  return `${year}-${month}-${day}`;
+}
+
+function obtenerCodigoDiaHoy() {
+  const dias = ['D', 'L', 'M', 'MI', 'J', 'V', 'S'];
+  const fecha = new Date();
+
+  return dias[fecha.getDay()];
+}
+
+function normalizarFechaHoraMysql(valor) {
+  if (!valor) {
+    return null;
+  }
+
+  const fecha = valor instanceof Date ? valor : new Date(valor);
+
+  if (Number.isNaN(fecha.getTime())) {
+    return null;
+  }
+
+  const year = fecha.getFullYear();
+  const month = String(fecha.getMonth() + 1).padStart(2, '0');
+  const day = String(fecha.getDate()).padStart(2, '0');
+  const hours = String(fecha.getHours()).padStart(2, '0');
+  const minutes = String(fecha.getMinutes()).padStart(2, '0');
+  const seconds = String(fecha.getSeconds()).padStart(2, '0');
+
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+function formatearActividadDiariaHoy(row) {
+  const actividad = formatearActividadDiaria(row);
+
+  return {
+    ...actividad,
+    completada_hoy: row.log_id !== null && row.log_id !== undefined,
+    completed_at: row.completed_at ? normalizarFechaHoraMysql(row.completed_at) : null,
+    exp_awarded: row.exp_awarded === null || row.exp_awarded === undefined
+      ? null
+      : Number(row.exp_awarded),
+  };
+}
+
+exports.verActividadesDiariasDeHoy = async (req, res) => {
+  try {
+    const usuarioId = obtenerUsuarioId(req);
+
+    if (!usuarioId) {
+      return res.status(401).json({
+        status: 'error',
+        mensaje: 'No hay usuario en sesión',
+      });
+    }
+
+    const fechaHoy = obtenerFechaHoyMysql();
+    const diaHoy = obtenerCodigoDiaHoy();
+
+    const [resultados] = await db.query(
+      `
+        SELECT
+          da.id,
+          da.user_id,
+          da.name,
+          da.description,
+          da.repeat_days,
+          da.scheduled_time,
+          da.priority,
+          da.exp_value,
+          da.is_active,
+          da.created_at,
+          da.updated_at,
+          dal.id AS log_id,
+          dal.completed_at,
+          dal.exp_awarded
+        FROM daily_activities da
+        LEFT JOIN daily_activity_logs dal
+          ON dal.daily_activity_id = da.id
+          AND dal.user_id = da.user_id
+          AND dal.completed_date = ?
+        WHERE da.user_id = ?
+          AND da.deleted_at IS NULL
+          AND da.is_active = 1
+          AND JSON_CONTAINS(da.repeat_days, JSON_QUOTE(?))
+        ORDER BY da.scheduled_time ASC, da.id DESC
+      `,
+      [
+        fechaHoy,
+        Number(usuarioId),
+        diaHoy,
+      ]
+    );
+
+    const actividades = resultados.map(formatearActividadDiariaHoy);
+
+    return res.status(200).json({
+      status: 'ok',
+      fecha: fechaHoy,
+      dia: diaHoy,
+      total: actividades.length,
+      actividades,
+    });
+  } catch (error) {
+    console.error('Error al consultar actividades diarias de hoy:', error);
+
+    return res.status(500).json({
+      status: 'error',
+      mensaje: 'Error al consultar actividades diarias de hoy',
+      detalle: error.message,
+      codigo: error.code,
+      sqlMessage: error.sqlMessage,
+    });
+  }
+};
+
+exports.completarActividadDiariaHoy = async (req, res) => {
+  const connection = await db.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    const usuarioId = obtenerUsuarioId(req);
+    const { id } = req.params;
+
+    if (!usuarioId) {
+      await connection.rollback();
+
+      return res.status(401).json({
+        status: 'error',
+        mensaje: 'No hay usuario en sesión',
+      });
+    }
+
+    const actividadPrevia = await buscarActividadDiariaPorIdYUsuario(
+      id,
+      usuarioId,
+      connection
+    );
+
+    if (!actividadPrevia) {
+      await connection.rollback();
+
+      return res.status(404).json({
+        status: 'error',
+        mensaje: 'Actividad diaria no encontrada',
+      });
+    }
+
+    if (Number(actividadPrevia.is_active || 0) !== 1) {
+      await connection.rollback();
+
+      return res.status(400).json({
+        status: 'error',
+        mensaje: 'Esta actividad diaria está pausada',
+      });
+    }
+
+    const fechaHoy = obtenerFechaHoyMysql();
+    const diaHoy = obtenerCodigoDiaHoy();
+    const diasActividad = parsearDiasDesdeBD(actividadPrevia.repeat_days);
+
+    if (!diasActividad.includes(diaHoy)) {
+      await connection.rollback();
+
+      return res.status(400).json({
+        status: 'error',
+        mensaje: 'Esta misión diaria no corresponde al día de hoy',
+        dia_hoy: diaHoy,
+        dias_actividad: diasActividad,
+      });
+    }
+
+    const [logsPrevios] = await connection.query(
+      `
+        SELECT id
+        FROM daily_activity_logs
+        WHERE daily_activity_id = ?
+          AND user_id = ?
+          AND completed_date = ?
+        LIMIT 1
+      `,
+      [
+        Number(id),
+        Number(usuarioId),
+        fechaHoy,
+      ]
+    );
+
+    if (logsPrevios && logsPrevios.length > 0) {
+      await connection.rollback();
+
+      return res.status(409).json({
+        status: 'error',
+        mensaje: 'Esta misión diaria ya fue completada hoy',
+      });
+    }
+
+    const expGanada = Number(actividadPrevia.exp_value || 0);
+
+    const [resultadoLog] = await connection.query(
+      `
+        INSERT INTO daily_activity_logs (
+          daily_activity_id,
+          user_id,
+          completed_date,
+          exp_awarded
+        ) VALUES (?, ?, ?, ?)
+      `,
+      [
+        Number(id),
+        Number(usuarioId),
+        fechaHoy,
+        expGanada,
+      ]
+    );
+
+    await connection.query(
+      `
+        UPDATE usuario
+        SET exp = exp + ?
+        WHERE id = ?
+      `,
+      [
+        expGanada,
+        Number(usuarioId),
+      ]
+    );
+
+    const [usuarioActualizadoRows] = await connection.query(
+      `
+        SELECT id, nombre_usuario, correo, exp, status, alta, nivel
+        FROM usuario
+        WHERE id = ?
+        LIMIT 1
+      `,
+      [Number(usuarioId)]
+    );
+
+    await connection.commit();
+
+    const actividadRespuesta = {
+      ...formatearActividadDiaria(actividadPrevia),
+      completada_hoy: true,
+      completed_at: normalizarFechaHoraMysql(new Date()),
+      exp_awarded: expGanada,
+    };
+
+    const io = req.app.get('socketio');
+
+    if (io) {
+      io.emit('actividad_diaria_completada_hoy', {
+        actividad: actividadRespuesta,
+        usuario: usuarioActualizadoRows[0] || null,
+      });
+    }
+
+    return res.status(200).json({
+      status: 'ok',
+      mensaje: 'Misión diaria completada correctamente',
+      log_id: resultadoLog.insertId,
+      fecha: fechaHoy,
+      dia: diaHoy,
+      exp_ganada: expGanada,
+      actividad: actividadRespuesta,
+      usuario: usuarioActualizadoRows[0] || null,
+    });
+  } catch (error) {
+    await connection.rollback();
+
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({
+        status: 'error',
+        mensaje: 'Esta misión diaria ya fue completada hoy',
+      });
+    }
+
+    console.error('Error al completar actividad diaria de hoy:', error);
+
+    return res.status(500).json({
+      status: 'error',
+      mensaje: 'Error al completar actividad diaria de hoy',
+      detalle: error.message,
+      codigo: error.code,
+      sqlMessage: error.sqlMessage,
+    });
+  } finally {
+    connection.release();
+  }
+};
