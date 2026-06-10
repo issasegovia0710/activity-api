@@ -1,6 +1,37 @@
 const db = require('../config/db');
 
 const DIAS_VALIDOS = ['L', 'M', 'MI', 'J', 'V', 'S', 'D'];
+const ZONA_HORARIA_APP = 'America/Mexico_City';
+
+function obtenerPartesFechaEnZona(fecha = new Date()) {
+  const partes = new Intl.DateTimeFormat('en-US', {
+    timeZone: ZONA_HORARIA_APP,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(fecha);
+
+  const mapa = {};
+
+  for (const parte of partes) {
+    if (parte.type !== 'literal') {
+      mapa[parte.type] = parte.value;
+    }
+  }
+
+  return mapa;
+}
+
+function obtenerFechaHoraServidorMexico(fecha = new Date()) {
+  const partes = obtenerPartesFechaEnZona(fecha);
+
+  return `${partes.year}-${partes.month}-${partes.day} ${partes.hour}:${partes.minute}:${partes.second}`;
+}
 
 const MAP_PRIORIDAD_ES_A_EN = {
   baja: 'low',
@@ -842,25 +873,46 @@ exports.eliminarActividadDiaria = async (req, res) => {
 };
 
 function obtenerFechaHoyMysql() {
-  const fecha = new Date();
+  const partes = obtenerPartesFechaEnZona(new Date());
 
-  const year = fecha.getFullYear();
-  const month = String(fecha.getMonth() + 1).padStart(2, '0');
-  const day = String(fecha.getDate()).padStart(2, '0');
-
-  return `${year}-${month}-${day}`;
+  return `${partes.year}-${partes.month}-${partes.day}`;
 }
 
 function obtenerCodigoDiaHoy() {
-  const dias = ['D', 'L', 'M', 'MI', 'J', 'V', 'S'];
-  const fecha = new Date();
+  const partes = obtenerPartesFechaEnZona(new Date());
 
-  return dias[fecha.getDay()];
+  const mapaDias = {
+    Sun: 'D',
+    Mon: 'L',
+    Tue: 'M',
+    Wed: 'MI',
+    Thu: 'J',
+    Fri: 'V',
+    Sat: 'S',
+  };
+
+  return mapaDias[partes.weekday] || 'L';
 }
 
 function normalizarFechaHoraMysql(valor) {
   if (!valor) {
     return null;
+  }
+
+  if (typeof valor === 'string') {
+    const texto = valor.trim();
+
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(texto)) {
+      return texto;
+    }
+
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(texto)) {
+      const fechaIso = new Date(texto);
+
+      if (!Number.isNaN(fechaIso.getTime())) {
+        return obtenerFechaHoraServidorMexico(fechaIso);
+      }
+    }
   }
 
   const fecha = valor instanceof Date ? valor : new Date(valor);
@@ -869,14 +921,7 @@ function normalizarFechaHoraMysql(valor) {
     return null;
   }
 
-  const year = fecha.getFullYear();
-  const month = String(fecha.getMonth() + 1).padStart(2, '0');
-  const day = String(fecha.getDate()).padStart(2, '0');
-  const hours = String(fecha.getHours()).padStart(2, '0');
-  const minutes = String(fecha.getMinutes()).padStart(2, '0');
-  const seconds = String(fecha.getSeconds()).padStart(2, '0');
-
-  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+  return obtenerFechaHoraServidorMexico(fecha);
 }
 
 function formatearActividadDiariaHoy(row) {
@@ -947,6 +992,8 @@ exports.verActividadesDiariasDeHoy = async (req, res) => {
       status: 'ok',
       fecha: fechaHoy,
       dia: diaHoy,
+      server_time: obtenerFechaHoraServidorMexico(),
+      server_timezone: ZONA_HORARIA_APP,
       total: actividades.length,
       actividades,
     });
@@ -1047,19 +1094,23 @@ exports.completarActividadDiariaHoy = async (req, res) => {
 
     const expGanada = Number(actividadPrevia.exp_value || 0);
 
+    const fechaHoraCompletada = obtenerFechaHoraServidorMexico();
+
     const [resultadoLog] = await connection.query(
       `
         INSERT INTO daily_activity_logs (
           daily_activity_id,
           user_id,
           completed_date,
+          completed_at,
           exp_awarded
-        ) VALUES (?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?)
       `,
       [
         Number(id),
         Number(usuarioId),
         fechaHoy,
+        fechaHoraCompletada,
         expGanada,
       ]
     );
@@ -1091,7 +1142,7 @@ exports.completarActividadDiariaHoy = async (req, res) => {
     const actividadRespuesta = {
       ...formatearActividadDiaria(actividadPrevia),
       completada_hoy: true,
-      completed_at: normalizarFechaHoraMysql(new Date()),
+      completed_at: fechaHoraCompletada,
       exp_awarded: expGanada,
     };
 
@@ -1110,6 +1161,8 @@ exports.completarActividadDiariaHoy = async (req, res) => {
       log_id: resultadoLog.insertId,
       fecha: fechaHoy,
       dia: diaHoy,
+      server_time: obtenerFechaHoraServidorMexico(),
+      server_timezone: ZONA_HORARIA_APP,
       exp_ganada: expGanada,
       actividad: actividadRespuesta,
       usuario: usuarioActualizadoRows[0] || null,
