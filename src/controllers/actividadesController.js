@@ -564,6 +564,40 @@ async function crearSiguienteActividadSiAplica(connection, actividad) {
   return resultado.insertId;
 }
 
+async function compactarOrdenPrioridad(connection, usuario_id) {
+  const [priorizadas] = await connection.query(
+    `
+      SELECT id, orden_prioridad
+      FROM actividades
+      WHERE usuario_id = ?
+        AND estatus = 'pendiente'
+        AND orden_prioridad IS NOT NULL
+      ORDER BY orden_prioridad ASC, fecha_fin ASC, id ASC
+      FOR UPDATE
+    `,
+    [Number(usuario_id)]
+  );
+
+  for (let index = 0; index < priorizadas.length; index += 1) {
+    const posicionCorrecta = index + 1;
+    const actividad = priorizadas[index];
+
+    if (Number(actividad.orden_prioridad) === posicionCorrecta) {
+      continue;
+    }
+
+    await connection.query(
+      `
+        UPDATE actividades
+        SET orden_prioridad = ?
+        WHERE id = ?
+          AND usuario_id = ?
+      `,
+      [posicionCorrecta, Number(actividad.id), Number(usuario_id)]
+    );
+  }
+}
+
 exports.verTiposDelUsuario = async (req, res) => {
   try {
     const usuario_id = req.usuario?.id;
@@ -628,6 +662,7 @@ exports.verActividadesDelUsuario = async (req, res) => {
         descripcion,
         tipo,
         prioridad,
+        orden_prioridad,
         valor_exp,
         duracion_horas,
         fecha_inicio,
@@ -682,6 +717,7 @@ exports.verActividadPorId = async (req, res) => {
         descripcion,
         tipo,
         prioridad,
+        orden_prioridad,
         valor_exp,
         duracion_horas,
         fecha_inicio,
@@ -939,7 +975,8 @@ exports.completarActividad = async (req, res) => {
       `
         UPDATE actividades
         SET estatus = 'completada',
-            auxiliar = ?
+            auxiliar = ?,
+            orden_prioridad = NULL
         WHERE id = ?
           AND usuario_id = ?
       `,
@@ -949,6 +986,8 @@ exports.completarActividad = async (req, res) => {
         Number(usuario_id),
       ]
     );
+
+    await compactarOrdenPrioridad(connection, usuario_id);
 
     let siguienteActividadId = null;
 
@@ -995,6 +1034,199 @@ exports.completarActividad = async (req, res) => {
     return res.status(500).json({
       status: 'error',
       mensaje: 'Error al completar actividad',
+      detalle: error.message,
+      codigo: error.code,
+      sqlMessage: error.sqlMessage,
+    });
+  } finally {
+    connection.release();
+  }
+};
+
+exports.actualizarOrdenPrioridad = async (req, res) => {
+  const connection = await db.getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    const usuario_id = req.usuario?.id;
+    const { id } = req.params;
+    const valorRecibido = req.body?.orden_prioridad;
+
+    if (!usuario_id) {
+      await connection.rollback();
+      return res.status(401).json({
+        status: 'error',
+        mensaje: 'No hay usuario en sesión',
+      });
+    }
+
+    const [actividades] = await connection.query(
+      `
+        SELECT id, estatus, orden_prioridad
+        FROM actividades
+        WHERE id = ?
+          AND usuario_id = ?
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [Number(id), Number(usuario_id)]
+    );
+
+    if (!actividades || actividades.length === 0) {
+      await connection.rollback();
+      return res.status(404).json({
+        status: 'error',
+        mensaje: 'Actividad no encontrada',
+      });
+    }
+
+    let actividad = actividades[0];
+
+    if (String(actividad.estatus || '').trim().toLowerCase() !== 'pendiente') {
+      await connection.rollback();
+      return res.status(400).json({
+        status: 'error',
+        mensaje: 'Solo se puede asignar orden de prioridad a actividades pendientes',
+      });
+    }
+
+    await compactarOrdenPrioridad(connection, usuario_id);
+
+    const [actividadNormalizadaRows] = await connection.query(
+      `
+        SELECT id, estatus, orden_prioridad
+        FROM actividades
+        WHERE id = ?
+          AND usuario_id = ?
+        LIMIT 1
+      `,
+      [Number(id), Number(usuario_id)]
+    );
+
+    actividad = actividadNormalizadaRows[0] || actividad;
+
+    const ordenAnterior =
+      actividad.orden_prioridad === null || actividad.orden_prioridad === undefined
+        ? null
+        : Number(actividad.orden_prioridad);
+
+    const quitarPrioridad =
+      valorRecibido === null ||
+      valorRecibido === undefined ||
+      String(valorRecibido).trim() === '' ||
+      Number(valorRecibido) === 0;
+
+    // Sacamos temporalmente la actividad de la cola y cerramos el hueco anterior.
+    await connection.query(
+      `
+        UPDATE actividades
+        SET orden_prioridad = NULL
+        WHERE id = ?
+          AND usuario_id = ?
+      `,
+      [Number(id), Number(usuario_id)]
+    );
+
+    if (ordenAnterior !== null && Number.isInteger(ordenAnterior) && ordenAnterior > 0) {
+      await connection.query(
+        `
+          UPDATE actividades
+          SET orden_prioridad = orden_prioridad - 1
+          WHERE usuario_id = ?
+            AND estatus = 'pendiente'
+            AND orden_prioridad > ?
+        `,
+        [Number(usuario_id), ordenAnterior]
+      );
+    }
+
+    if (quitarPrioridad) {
+      await connection.commit();
+
+      return res.status(200).json({
+        status: 'ok',
+        mensaje: 'Prioridad de ejecución eliminada',
+        actividad: {
+          id: Number(id),
+          orden_prioridad: null,
+        },
+      });
+    }
+
+    const ordenSolicitado = Number(valorRecibido);
+
+    if (!Number.isInteger(ordenSolicitado) || ordenSolicitado < 1) {
+      await connection.rollback();
+      return res.status(400).json({
+        status: 'error',
+        mensaje: 'La prioridad debe ser un número entero mayor o igual a 1',
+      });
+    }
+
+    const [conteoRows] = await connection.query(
+      `
+        SELECT COUNT(*) AS total
+        FROM actividades
+        WHERE usuario_id = ?
+          AND estatus = 'pendiente'
+          AND orden_prioridad IS NOT NULL
+      `,
+      [Number(usuario_id)]
+    );
+
+    const totalPriorizadas = Number(conteoRows?.[0]?.total || 0);
+    const nuevaPosicion = Math.min(ordenSolicitado, totalPriorizadas + 1);
+
+    // Abrimos espacio para la nueva posición. Así nunca quedan dos tareas con el mismo número.
+    await connection.query(
+      `
+        UPDATE actividades
+        SET orden_prioridad = orden_prioridad + 1
+        WHERE usuario_id = ?
+          AND estatus = 'pendiente'
+          AND orden_prioridad >= ?
+      `,
+      [Number(usuario_id), nuevaPosicion]
+    );
+
+    await connection.query(
+      `
+        UPDATE actividades
+        SET orden_prioridad = ?
+        WHERE id = ?
+          AND usuario_id = ?
+      `,
+      [nuevaPosicion, Number(id), Number(usuario_id)]
+    );
+
+    await connection.commit();
+
+    const io = req.app.get('socketio');
+    if (io) {
+      io.emit('actividad_actualizada', {
+        id: Number(id),
+        usuario_id: Number(usuario_id),
+        orden_prioridad: nuevaPosicion,
+      });
+    }
+
+    return res.status(200).json({
+      status: 'ok',
+      mensaje: 'Prioridad de ejecución actualizada',
+      actividad: {
+        id: Number(id),
+        orden_prioridad: nuevaPosicion,
+      },
+    });
+  } catch (error) {
+    await connection.rollback();
+
+    console.error('Error al actualizar orden de prioridad:', error);
+
+    return res.status(500).json({
+      status: 'error',
+      mensaje: 'Error al actualizar el orden de prioridad',
       detalle: error.message,
       codigo: error.code,
       sqlMessage: error.sqlMessage,
@@ -1177,6 +1409,23 @@ exports.editarActividad = async (req, res) => {
 
     const [resultado] = await connection.query(sql, valores);
 
+    if (
+      String(actividadPrevia.estatus || '').trim().toLowerCase() === 'pendiente' &&
+      String(nuevoEstatus || '').trim().toLowerCase() !== 'pendiente'
+    ) {
+      await connection.query(
+        `
+          UPDATE actividades
+          SET orden_prioridad = NULL
+          WHERE id = ?
+            AND usuario_id = ?
+        `,
+        [Number(id), Number(usuario_id)]
+      );
+
+      await compactarOrdenPrioridad(connection, usuario_id);
+    }
+
     const actividadActualizada = {
       ...actividadPrevia,
       id: Number(id),
@@ -1241,31 +1490,41 @@ exports.editarActividad = async (req, res) => {
 };
 
 exports.eliminarActividad = async (req, res) => {
+  const connection = await db.getConnection();
+
   try {
+    await connection.beginTransaction();
+
     const usuario_id = req.usuario?.id;
     const { id } = req.params;
 
     if (!usuario_id) {
+      await connection.rollback();
       return res.status(401).json({
         status: 'error',
         mensaje: 'No hay usuario en sesión',
       });
     }
 
-    const sql = `
-      DELETE FROM actividades
-      WHERE id = ?
-        AND usuario_id = ?
-    `;
-
-    const [resultado] = await db.query(sql, [Number(id), Number(usuario_id)]);
+    const [resultado] = await connection.query(
+      `
+        DELETE FROM actividades
+        WHERE id = ?
+          AND usuario_id = ?
+      `,
+      [Number(id), Number(usuario_id)]
+    );
 
     if (resultado.affectedRows === 0) {
+      await connection.rollback();
       return res.status(404).json({
         status: 'error',
         mensaje: 'Actividad no encontrada',
       });
     }
+
+    await compactarOrdenPrioridad(connection, usuario_id);
+    await connection.commit();
 
     const io = req.app.get('socketio');
 
@@ -1282,6 +1541,8 @@ exports.eliminarActividad = async (req, res) => {
       id: Number(id),
     });
   } catch (error) {
+    await connection.rollback();
+
     console.error('Error al eliminar actividad:', error);
 
     return res.status(500).json({
@@ -1291,6 +1552,8 @@ exports.eliminarActividad = async (req, res) => {
       codigo: error.code,
       sqlMessage: error.sqlMessage,
     });
+  } finally {
+    connection.release();
   }
 };
 
@@ -1350,7 +1613,8 @@ exports.procesarVencidas = async (req, res) => {
         `
           UPDATE actividades
           SET estatus = 'no_cumplida',
-              auxiliar = ?
+              auxiliar = ?,
+              orden_prioridad = NULL
           WHERE id = ?
             AND usuario_id = ?
         `,
@@ -1389,6 +1653,10 @@ exports.procesarVencidas = async (req, res) => {
         penalizacion,
         siguiente_actividad_id: siguienteActividadId,
       });
+    }
+
+    if (procesadas.length > 0) {
+      await compactarOrdenPrioridad(connection, usuario_id);
     }
 
     const [usuarioActualizadoRows] = await connection.query(

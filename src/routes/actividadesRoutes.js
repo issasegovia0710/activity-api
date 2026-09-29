@@ -59,6 +59,7 @@ router.delete('/ejercicios/:id', ejerciciosController.eliminarEjercicio);
 router.get('/:id', actividadesController.verActividadPorId);
 router.post('/', actividadesController.agregarActividad);
 router.put('/:id/completar', actividadesController.completarActividad);
+router.put('/:id/orden-prioridad', actividadesController.actualizarOrdenPrioridad);
 router.put('/:id/cierre', actividadesController.editarCierreActividad);
 router.put('/:id', actividadesController.editarActividad);
 router.delete('/:id', actividadesController.eliminarActividad);
